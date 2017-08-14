@@ -62,6 +62,7 @@ def refreshCreds(credentials,sleep):
 def flatten(name):
         return re.sub("#[0-9]*$", "", name).rstrip()
 
+
 # determine what webphotos exist are 
 def scanWebPhotos(webAlbum, rootDirs, webAlbumTitle):
     photos = repeat(lambda: gd_client.GetFeed(webAlbum.GetPhotosUri() + "&imgmax=d"), "list photos in album", True)
@@ -69,7 +70,7 @@ def scanWebPhotos(webAlbum, rootDirs, webAlbumTitle):
         photoDate = datetime.fromtimestamp(int(photo.timestamp.text[0:10])).strftime('%Y/%m/%d')
         photoTitle = urllib.unquote(photoDate + "/" + photo.title.text)
 
-        localPhotoPath = rootDirs[0] + "/"
+        localPhotoPath = rootDirs + "/"
         file = RemoteFileEntry(photo.title.text, localPhotoPath, photo, photoDate, webAlbumTitle)
 
         if verbose or debug:
@@ -113,15 +114,6 @@ def scanWebPhotos(webAlbum, rootDirs, webAlbumTitle):
                     entryCaptured = True
                     print "error, shouldn't happen"
 
-
-                
-# Download the photos from online
-def downloadWebPhotos():
-    # download files
-    for photoTitle in onlineEntries:
-        file = onlineEntries[photoTitle]
-        file.download_file()
-
 # repeat function
 def repeat(function,  description, onFailRethrow):
 	exc_info = None
@@ -144,14 +136,248 @@ def repeat(function,  description, onFailRethrow):
 		print ("WARNING: Failed to %s. This was due to %s" % (description, exc_info))
 		if onFailRethrow:
 			raise exc_info
+#Class for local album scanning
+class localFolder:
+    def __init__(self, rootDirs):
+        self.rootDirs = rootDirs
+        self.entries = {}
+        self.albums = self.scanFileSystem()
+
+ # walk the directory tree populating the list of files we have locally
+    # @print_timing
+    def scanFileSystem(self):
+        fileAlbums = {}
+        for dirName, subdirList, fileList in os.walk(rootDirs):
+            subdirList[:] = [d for d in subdirList]
+            albumName = dirName
+            # have we already seen this album? If so append our path to it's list
+            if albumName in fileAlbums:
+                album = fileAlbums[albumName]
+                thisRoot = album.suggestNewRoot(dirName)
+            else:
+                # create a new album
+                thisRoot = dirName
+                album = AlbumEntry(dirName, albumName)
+                fileAlbums[albumName] = album
+            # now iterate it's files to add them to our list
+            for fname in fileList:
+                fullFilename = os.path.join(dirName, fname)
+                relFileName = re.sub("^/", "", fullFilename[len(thisRoot):])
+                fileEntry = LocalFileEntry(relFileName, fullFilename, albumName)
+                   
+                if ( albumsOnly and fileEntry.getLocalAlbumName() == ""  ) or fileEntry.getType() == None:
+                    continue  # ignoring the local album or file types of None.
+                if debug: 
+                    print "--------"
+                    fileEntry.print_entry()
+
+                self.entries[fileEntry.getLocalPhotoPath()] = fileEntry
+        if verbose:
+            print ("Found " + str(len(fileAlbums)) + " albums on the filesystem")
+        return fileAlbums;
+
+    def getAlbums(self):
+        return self.albums
+
+    def getEntries(self):
+        return self.entries
+
+class AlbumEntry:
+    def __init__(self, fileName, albumName):
+        self.paths = [fileName]
+        self.rootPath = fileName
+        self.albumName = albumName
+        self.entries = {}
+        self.webAlbum = []
+        self.webAlbumIndex = 0
+        self.earliestDate = None
+
+    def returnEnteries(self):
+        return self.entries
 
 # Class to store details of an individual file
+class LocalFileEntry:
+    def __init__(self, name, path, album):
+        self.name = name
+        if path:
+            self.path = path
+            self.type = mimetypes.guess_type(path)[0]
+            if str("video") in str(self.type):
+                self.type = "video"
+        else:
+            self.path = os.path.join(album.rootPath, name)
+            self.type = None
+        self.localHash = None
+        self.localSize = os.path.getsize(self.path)
+        self.localDate = os.path.getmtime(self.path)
+        self.album = album
+
+        self.localPhotoPath = self.path.replace(rootDirs+"/",'')
+        self.localAlbumName = self.album.replace(rootDirs+"/",'')
+        if self.localAlbumName == datetime.fromtimestamp(self.localDate).strftime('%Y/%m/%d'):
+            self.localAlbumName = ""
+        self.setHash()
+
+    def setHash(self):
+        if self.type == "video":
+            #don't include the file size on video hash
+            self.hash = hash(str(self.name) + str(self.localDate))
+            self.albumHash = hash(str(self.localAlbumName) + str(self.name) + str(self.localDate))
+        else:            
+            self.hash = hash(str(self.name) + str(self.localSize) + str(self.localDate))
+            self.albumHash = hash(str(self.localAlbumName) + str(self.name) + str(self.localSize) + str(self.localDate))
+
+    def print_entry(self):
+        print ("name %s" % self.name)
+        print ("album %s" % self.album)
+        print ("localAlbumName %s" % self.localAlbumName)
+        print ("path %s" % self.path)
+        print ("localPhotoPath %s " % self.localPhotoPath)
+        print ("localSize %s" % self.localSize)
+        print ("Localdate %s" % self.localDate)
+        print ("Album Hash %s" % self.albumHash)
+        print ("hash %s" % self.hash)
+        print ("type %s" % self.type)
+
+    def getName(self):
+        return self.name
+
+    def getType(self):
+        return self.type
+
+    def getLocalAlbumName(self):
+        return self.localAlbumName
+
+    def getAlbumHash(self):
+        return self.albumHash
+
+    def getLocalPhotoPath(self):
+        return self.localPhotoPath
+
+    def getFullPath(self):
+        return self.path
+# ----------------------------------------------#
+# Class to compare online vs local
+# ----------------------------------------------#
+class compareWebandLocal:
+    def __init__(self,localFolder):
+        self.toDownload = {}
+        self.localDelete = {}
+        self.purgedCount = 0
+        self.downloadCount = 0
+        self.onlineEntries = onlineEntries
+        self.localEntries = localFolder.getEntries()
+        self.compare()
+
+    def compare(self):
+        # loop through online items to create list that is missing
+        for photoTitle in self.onlineEntries:
+            localFound = False
+            file = self.onlineEntries[photoTitle]
+
+            fileAlbumHash = file.getAlbumHash()
+
+            for localEntry in self.localEntries:
+
+                if fileAlbumHash == self.localEntries[localEntry].getAlbumHash():
+                    #entry found,
+                    localFound = True
+                    if debug:
+                        print "Matched local vs web %s" % self.localEntries[localEntry].getName()
+                    del self.localEntries[localEntry]
+                    break 
+            
+            if localFound == False:
+                if verbose or debug:
+                    print "added to download: Local not found %s" % file.getName(),
+                    print "path %s" % file.getAlbum()
+                self.toDownload[photoTitle] = file
+
+        if debug or verbose:
+            print '--- Local Entries to be purged ---'
+            for localEntry in self.localEntries:
+                self.localEntries[localEntry].print_entry()
+            print '--- web Entries to be downloaded ---'
+            for toDownload in self.toDownload:
+                self.toDownload[toDownload].print_entry()
+
+    def printStatsPre(self):
+        self.preTime = datetime.now()
+        print '###########################################'
+        print "# Items missing on local storage  : %s" % str(len(self.toDownload))
+        print "# Mis-match items, i.e. not online: %s" % str(len(self.localEntries))
+    def printStatsPost(self):
+        self.postTime = datetime.now()
+        print '#-----------------------------------------#'
+        print '# Items downloaded: %s' % self.downloadCount
+        print '# Items purged    : %s' % self.purgedCount
+        print '#-----------------------------------------#'
+        print '# Start Time      : %s' % str(self.preTime)
+        print '# End Time        : %s' % str(self.postTime)
+        print '# total runtime   : %s' % str(self.postTime - self.preTime)
+        print '###########################################'
+    def download(self):
+        # Download the photos from online
+        for photoTitle in self.toDownload:
+            file =  self.toDownload[photoTitle]
+            if verbose:
+                print 'Downloading %s' % file.getName()
+            if file.download_file():
+                self.downloadCount += 1
+
+    def purge(self):
+        #purge files.
+        for photoTitle in self.localEntries:
+            file = self.localEntries[photoTitle]
+            if verbose:
+                print 'purging %s' % file.getFullPath()
+            if not test:
+                try:
+                    os.remove(file.getFullPath())
+                    self.purgedCount += 1
+                except OSError as err:
+                    if debug:
+                        print("OS error: {0}".format(err))
+                    continue
+            else:
+                print "Test mode -Local file %s to be purged" % file.getFullPath()
+        #remove blank folders
+        self.removeEmptyFolders(rootDirs + "/")
+
+
+    def removeEmptyFolders(self, path, removeRoot = True):
+        'Function to remove empty folders'
+        if not os.path.isdir(path):
+            return
+        # remove empty subfolders
+        files = os.listdir(path)
+        if len(files):
+            for f in files:
+                fullpath = os.path.join(path, f)
+                if os.path.isdir(fullpath):
+                    self.removeEmptyFolders(fullpath)
+
+        # if folder empty, delete it
+        files = os.listdir(path)
+        if len(files) == 0 and removeRoot:
+            if not test:
+                print "Removing empty folder:", path
+                os.rmdir(path)
+            else:
+                print "Test mode -Local folder %s to be removed" % path
+
+
+# ----------------------------------------------#
+# Class to store details of an individual file
+# ----------------------------------------------#
 class RemoteFileEntry:
     def __init__(self, name, path, webReference, datePath, album):
         self.name = name
         if path:
             self.path = path
             self.type = mimetypes.guess_type(path)[0]
+            if str(self.type).startswith('video'):
+                self.type = "video"
         else:
             self.path = os.path.join(album.rootPath, name)
             self.type = None
@@ -177,7 +403,16 @@ class RemoteFileEntry:
     def updateName(self,Number):
         newName = self.name.rsplit('.',1)[0] +" ("+str(Number)+")."+self.name.rsplit('.',1)[1]
         self.name = newName
-        self.albumHash = hash(str(self.album) + str(self.name) + str(self.remoteSize) + str(self.remoteTimestamp))
+        self.setHash()
+
+    def setHash(self):
+        if self.type == "video":
+            #don't include the file size on video hash'
+            self.albumHash = hash(str(self.album) + str(self.name) +  str(self.remoteTimestamp))
+            self.hash = hash(str(self.name) + str(self.remoteTimestamp))
+        else:
+            self.albumHash = hash(str(self.album) + str(self.name) + str(self.remoteSize) + str(self.remoteTimestamp))
+            self.hash = hash(str(self.name) + str(self.remoteSize) + str(self.remoteTimestamp))  
 
     def setWebReference(self, webReference):
         if webReference:
@@ -185,6 +420,8 @@ class RemoteFileEntry:
                 # If we haven't found a type yet, or prioritise video type
                 if not self.type or (content.medium == 'video'):
                     self.type = content.type
+                if str(self.type).startswith('video'):
+                    self.type = "video"
 
             self.gphoto_id = webReference.gphoto_id.text
             self.albumid = webReference.albumid.text
@@ -202,8 +439,7 @@ class RemoteFileEntry:
                               '%Y-%m-%dT%H:%M:%S.000 %Z'))
             self.remoteTimestamp = time.mktime(webReference.timestamp.datetime().timetuple())
             self.remoteSize = int(webReference.size.text)
-            self.hash = hash(str(self.name) + str(self.remoteSize) + str(self.remoteTimestamp))
-            self.albumHash = hash(str(self.album) + str(self.name) + str(self.remoteSize) + str(self.remoteTimestamp))
+            self.setHash()
         else:
             self.webUrl = None
 
@@ -217,6 +453,9 @@ class RemoteFileEntry:
         print ("Remote date %s" % self.remoteDate)
         print ("RemoteTimesamp %s" % self.remoteTimestamp) 
         print ("Remote size %s" % self.remoteSize)
+        print ("Album Hash %s" % self.albumHash)
+        print ("hash %s" % self.hash)
+        print ("type %s" % self.type)
 
     def download_file(self):
         url = self.webUrl
@@ -263,24 +502,43 @@ class RemoteFileEntry:
                 if self.localDate == self.remoteTimestamp and (self.localSize == self.remoteSize or self.type =='video'):
                     if verbose:
                         print "Success: download of %s completed" % local_filename
+                    return True
                 else:
                     if verbose or debug:
                         print "Error when downloading %s" % local_filename
                         if debug: 
                                 print "---Local Date %s, Remote Date %s ---" % (self.localDate, self.remoteTimestamp)
                                 print "---Local size %s, Remote size %s ---" % (self.localSize, self.remoteSize)
+                    return False
             else:
                 print "Test mode -file %s to be downloaded" % local_filename
         else:
             if verbose or debug:
                 print "skipping File %s already downloaded" % local_filename
 
+# Get the web albums that are available. 
+def getWebFiles(webAlbums):
+    #First check for webalbums, then do immutableFolders
+    for webAlbum in webAlbums.entry:
+        webAlbumTitle = flatten(webAlbum.title.text)
+        if not webAlbum.title.text in immutableFolders:
+            if verbose or debug:
+                print ('Scanning web-album %s (containing %s files)' % (webAlbum.title.text, webAlbum.numphotos.text))
+            scanWebPhotos(webAlbum, rootDirs, webAlbumTitle)
+
+    if not albumsOnly:  #skip the immutableFolders if arg albums only is set
+        for webAlbum in webAlbums.entry:
+            webAlbumTitle = flatten(webAlbum.title.text)
+            if webAlbum.title.text in immutableFolders:
+                if verbose or debug:
+                    print ('Scanning web-album %s (containing %s files)' % (webAlbum.title.text, webAlbum.numphotos.text))
+                scanWebPhotos(webAlbum, rootDirs, "") # don't pass an album name
 
 # -------------------------------#
 # Main Program code
 # -------------------------------#
 parser = argparse.ArgumentParser()
-parser.add_argument("-d", "--directory", nargs='+',
+parser.add_argument("-d", "--directory",
                     help="The local directories. The first of these will be used for any downloaded items")
 parser.add_argument("-t", "--test", default=False, action='store_true',
                    help="Don't actually run activities, but report what you would have done (you may want to enable verbose)")
@@ -288,41 +546,52 @@ parser.add_argument("-o", "--owner", default="default",
                     help="The username of the user whos albums to sync (leave blank for your own)")
 parser.add_argument("-v", "--verbose", default=False, action='store_true', help="Increase verbosity")
 parser.add_argument("-D", "--debug", default=False, action='store_true', help="Debug mode")
-parser.add_argument("-a", "--albums", default=False, action='store_true', help="Albuums only, ignore auto backup, instant upload folders")
+parser.add_argument("-a", "--albums", default=False, action='store_true', help="Albums only, ignore auto backup, instant upload folders")
+parser.add_argument("-s", "--stats", default=False, action='store_true', help="Print the stats of what happened")
+parser.add_argument("--nopurge", default=False, action='store_true', help="Do not purge local files and folders that don't match with what is on the web")
+parser.add_argument("--nosync", default=False, action='store_true', help="Do not download items that are missing locally (default is to download)")
+
+
 
 args = parser.parse_args()
 # Global data Declerations #
 immutableFolders = frozenset(["Instant Upload","Auto-Backup","Auto Backup"])
 onlineEntries = {}   #online photos/videos
 
+
 # Arguments
 rootDirs = args.directory  # set the directory you want to sync to
+stats = args.stats   #print the stats for what will synced.
 verbose = args.verbose
 debug = args.debug
 test = args.test
 albumsOnly = args.albums
+nopurge = args.nopurge
+nosync = args.nosync
 
+#Main processing
 gd_client = oauthLogin()
 
 # walk the web album finding albums there
 webAlbums = gd_client.GetUserFeed(user=args.owner)
 
-#First check for webalbums, then do immutableFolders
-for webAlbum in webAlbums.entry:
-    webAlbumTitle = flatten(webAlbum.title.text)
-    if not webAlbum.title.text in immutableFolders:
-        if verbose or debug:
-            print ('Scanning web-album %s (containing %s files)' % (webAlbum.title.text, webAlbum.numphotos.text))
-        scanWebPhotos(webAlbum, rootDirs, webAlbumTitle)
+#get web files
+getWebFiles(webAlbums)
 
+#get local files
+localFiles = localFolder(rootDirs)
 
-if not albumsOnly:  #skip the immutableFolders if arg albums only is set
-    for webAlbum in webAlbums.entry:
-        webAlbumTitle = flatten(webAlbum.title.text)
-        if webAlbum.title.text in immutableFolders:
-            if verbose or debug:
-                print ('Scanning web-album %s (containing %s files)' % (webAlbum.title.text, webAlbum.numphotos.text))
-            scanWebPhotos(webAlbum, rootDirs, "") # don't pass an album name
-
-
-downloadWebPhotos()
+#compare online vs local
+comparedObjects = compareWebandLocal(localFiles)
+if stats:
+    comparedObjects.printStatsPre()
+#Purge objects if the purge flag is set
+#   this is done first to clean any files that might be partially downloaded
+if not nopurge:
+    comparedObjects.purge()
+#Download if nosync is not set
+if not nosync:
+    comparedObjects.download()
+#print stats
+if stats:
+    comparedObjects.printStatsPost()
